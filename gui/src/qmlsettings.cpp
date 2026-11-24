@@ -989,6 +989,19 @@ void QmlSettings::setDirectFrameMapping(bool enabled)
     emit directFrameMappingChanged();
 }
 
+bool QmlSettings::latestFrameDelivery() const
+{
+    return settings->GetLatestFrameDelivery();
+}
+
+void QmlSettings::setLatestFrameDelivery(bool enabled)
+{
+    if (enabled == settings->GetLatestFrameDelivery())
+        return;
+    settings->SetLatestFrameDelivery(enabled);
+    emit latestFrameDeliveryChanged();
+}
+
 void QmlSettings::setPlaceboFrameMixer(int mixer)
 {
     settings->SetPlaceboFrameMixer(static_cast<PlaceboFrameMixer>(mixer));
@@ -1970,6 +1983,7 @@ void QmlSettings::refreshAllKeys()
 void QmlSettings::refreshAllPlaceboKeys()
 {
     emit directFrameMappingChanged();
+    emit latestFrameDeliveryChanged();
     emit placeboUpscalerChanged();
     emit placeboPlaneUpscalerChanged();
     emit placeboDownscalerChanged();

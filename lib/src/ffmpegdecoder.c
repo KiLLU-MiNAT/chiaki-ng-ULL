@@ -188,6 +188,12 @@ CHIAKI_EXPORT bool chiaki_ffmpeg_decoder_video_sample_cb(uint8_t *buf, size_t bu
 		decoder->synthetic_packet_pts += synthetic_duration_pts * (int64_t)frames_lost;
 
 	AVPacket *packet = av_packet_alloc();
+	if(!packet)
+	{
+		CHIAKI_LOGE(decoder->log, "Failed to allocate video packet");
+		chiaki_mutex_unlock(&decoder->mutex);
+		return false;
+	}
 	packet->data = buf;
 	packet->size = buf_size;
 	packet->pts = decoder->synthetic_packet_pts;

@@ -45,6 +45,7 @@ set(SOURCE_FILES
 	include/qmlmainwindow.h
 	src/qmlmainwindow.cpp
 	include/qmlbackend.h
+	include/latestframemailbox.h
 	src/qmlbackend.cpp
 	include/qmlcontroller.h
 	src/qmlcontroller.cpp

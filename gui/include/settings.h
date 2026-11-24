@@ -520,6 +520,8 @@ class Settings : public QObject
 		PlaceboFrameMixer GetPlaceboFrameMixer() const;
 		bool GetDirectFrameMapping() const { return settings.value("settings/direct_frame_mapping", true).toBool(); }
 		void SetDirectFrameMapping(bool enabled) { settings.setValue("settings/direct_frame_mapping", enabled); }
+		bool GetLatestFrameDelivery() const { return settings.value("settings/latest_frame_delivery", true).toBool(); }
+		void SetLatestFrameDelivery(bool enabled) { settings.setValue("settings/latest_frame_delivery", enabled); }
 		void SetPlaceboFrameMixer(PlaceboFrameMixer frame_mixer);
 
 		bool GetPlaceboDeinterlaceEnabled() const;

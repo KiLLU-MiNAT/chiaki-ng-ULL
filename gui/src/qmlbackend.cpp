@@ -1,4 +1,8 @@
 #include "qmlbackend.h"
+#include "latestframemailbox.h"
+#include <QPointer>
+#include <limits>
+#include <memory>
 #include "qmlsettings.h"
 #include "qmlmainwindow.h"
 #include "streamsession.h"
@@ -39,6 +43,29 @@ extern "C" {
 #include <libavutil/pixdesc.h>
 #include <libavutil/pixfmt.h>
 }
+
+// Own the AVFrame until the GUI actually accepts it. This also releases
+// pictures from cancelled queued calls and from a disconnected session.
+struct GuiPresentationFrame
+{
+    ChiakiFfmpegFrame frame;
+    int32_t frames_lost;
+    int32_t coalesced = 0;
+    qint64 delivery_us;
+
+    GuiPresentationFrame(ChiakiFfmpegFrame frame, int32_t lost, qint64 delivery)
+        : frame(frame), frames_lost(lost), delivery_us(delivery) {}
+    ~GuiPresentationFrame() { av_frame_free(&frame.frame); }
+    GuiPresentationFrame(const GuiPresentationFrame &) = delete;
+    GuiPresentationFrame &operator=(const GuiPresentationFrame &) = delete;
+
+    void present(QmlMainWindow *window)
+    {
+        auto owned = frame;
+        frame.frame = nullptr;
+        window->presentFrame(owned, frames_lost, delivery_us);
+    }
+};
 
 static bool detailedVerboseTelemetryEnabled()
 {
@@ -1120,8 +1147,17 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
         return;
     }
 
-    connect(session, &StreamSession::FfmpegFrameAvailable, frame_thread->parent(), [this, use_opengl_renderer]() {
-        ChiakiFfmpegDecoder *decoder = session->GetFfmpegDecoder();
+    StreamSession *frame_session = session;
+    const QPointer<StreamSession> frame_session_guard(frame_session);
+    // Do not coalesce the timestamped frame queue path: it deliberately
+    // retains temporal history for frame mixing. Use the actual runtime mode.
+    const bool latest_frame_delivery = settings->GetLatestFrameDelivery()
+        && window->usesDirectFrameMapping();
+    auto mailbox = std::make_shared<LatestFrameMailbox<GuiPresentationFrame>>();
+    qCInfo(chiakiGui) << "[ULL] latest-frame GUI delivery:" << latest_frame_delivery;
+    connect(session, &StreamSession::FfmpegFrameAvailable, frame_thread->parent(),
+            [this, use_opengl_renderer, frame_session, frame_session_guard, latest_frame_delivery, mailbox]() {
+        ChiakiFfmpegDecoder *decoder = frame_session->GetFfmpegDecoder();
         if (!decoder) {
             qCCritical(chiakiGui) << "Session has no FFmpeg decoder";
             return;
@@ -1153,10 +1189,37 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
         }
 
         const qint64 delivery_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
-        QmlMainWindow *target_window = window;
-        QMetaObject::invokeMethod(target_window, [target_window, frame, frames_lost, delivery_us]() mutable {
-            target_window->presentFrame(frame, frames_lost, delivery_us);
+        auto picture = std::make_shared<GuiPresentationFrame>(frame, frames_lost, delivery_us);
+        if (!latest_frame_delivery) {
+            QMetaObject::invokeMethod(this, [this, frame_session_guard, picture]() {
+                if (frame_session_guard && session == frame_session_guard.data())
+                    picture->present(window);
+            }, Qt::QueuedConnection);
+            return;
+        }
+
+        // Keep at most one prepared picture awaiting GUI dispatch. Older
+        // pictures have already been decoded, so dropping their presentation
+        // does not break reference frames or packet-loss recovery.
+        const bool wake = mailbox->publish(picture, [](GuiPresentationFrame &next, const GuiPresentationFrame &old) {
+            const qint64 lost = static_cast<qint64>(next.frames_lost) + old.frames_lost + 1;
+            const qint64 limit = (std::numeric_limits<int32_t>::max)();
+            next.frames_lost = static_cast<int32_t>(qBound<qint64>(qint64(0), lost, limit));
+            next.coalesced = static_cast<int32_t>(qMin<qint64>(limit, static_cast<qint64>(old.coalesced) + 1));
         });
+        if (wake) {
+            const bool posted = QMetaObject::invokeMethod(this, [this, frame_session_guard, mailbox]() {
+                auto latest = mailbox->take();
+                if (latest && frame_session_guard && session == frame_session_guard.data()) {
+                    if (latest->coalesced > 0) {
+                        CHIAKI_NOISY_DEBUG() << "[ULL] superseded GUI frames=" << latest->coalesced;
+                    }
+                    latest->present(window);
+                }
+            }, Qt::QueuedConnection);
+            if (!posted)
+                mailbox->take();
+        }
     });
 
     StreamSession *session_for_connections = session;

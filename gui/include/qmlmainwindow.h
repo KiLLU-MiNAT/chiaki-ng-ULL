@@ -113,6 +113,7 @@ public:
     void increaseDroppedFrames();
 
     bool directStream() const;
+    bool usesDirectFrameMapping() const { return bypass_frame_queue; }
     int runtimeRendererBackend() const { return static_cast<int>(render_backend); }
     bool loadingTransitionComplete() const { return loading_transition_complete.loadAcquire() != 0; }
 

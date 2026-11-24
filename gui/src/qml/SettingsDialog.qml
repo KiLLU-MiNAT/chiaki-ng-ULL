@@ -977,6 +977,23 @@ DialogView {
 
                     Label {
                         Layout.alignment: Qt.AlignRight
+                        text: qsTr("Ultra Low Latency:")
+                    }
+
+                    C.CheckBox {
+                        enabled: Chiaki.settings.directFrameMapping
+                        checked: Chiaki.settings.latestFrameDelivery
+                        onClicked: Chiaki.settings.latestFrameDelivery = checked
+                    }
+
+                    Label {
+                        Layout.preferredWidth: 220
+                        wrapMode: Text.WordWrap
+                        text: qsTr("Latest decoded frame only if GUI is busy. Reconnect to apply.")
+                    }
+
+                    Label {
+                        Layout.alignment: Qt.AlignRight
                         text: qsTr("Frame Mixer:")
                     }
 
