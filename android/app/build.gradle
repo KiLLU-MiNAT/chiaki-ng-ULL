@@ -25,17 +25,21 @@ android {
     ndkVersion "28.2.13676358"
 
     defaultConfig {
-        applicationId "com.metallic.chiaki"
+        applicationId "com.metallic.chiaki.ull"
         minSdk 24
         targetSdk 35
         versionCode 12
-        versionName chiakiVersion
+        versionName "${chiakiVersion}-ull-android.1"
+        ndk { abiFilters "arm64-v8a" }
         externalNativeBuild {
             cmake {
                 arguments "-DCHIAKI_ENABLE_TESTS=OFF",
                         "-DCHIAKI_ENABLE_CLI=OFF",
                         "-DCHIAKI_ENABLE_GUI=OFF",
                         "-DCHIAKI_ENABLE_SETSU=OFF",
+                        "-DCHIAKI_ENABLE_SPEEX=OFF",
+                        "-DCHIAKI_USE_SYSTEM_NANOPB=OFF",
+                        "-DCHIAKI_USE_SYSTEM_JERASURE=OFF",
                         "-DCHIAKI_ENABLE_ANDROID=ON",
                         "-DCHIAKI_ENABLE_FFMPEG_DECODER=OFF",
                         "-DCHIAKI_ENABLE_PI_DECODER=OFF",
@@ -46,6 +50,7 @@ android {
                         "-DCHIAKI_ENABLE_STEAM_SHORTCUT=OFF",
                         "-DCHIAKI_ENABLE_STEAMDECK_NATIVE=OFF",
                         "-DANDROID_STL=c++_shared",
+                        "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
                         "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON",
                         "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384"
             }

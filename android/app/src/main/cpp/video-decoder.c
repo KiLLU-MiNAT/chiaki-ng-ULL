@@ -22,38 +22,31 @@ ChiakiErrorCode android_chiaki_video_decoder_init(AndroidChiakiVideoDecoder *dec
 	decoder->target_width = target_width;
 	decoder->target_height = target_height;
 	decoder->target_codec = codec;
-	decoder->shutdown_output = false;
+	__atomic_store_n(&decoder->shutdown_output, false, __ATOMIC_RELEASE);
+	decoder->window = NULL;
 	return chiaki_mutex_init(&decoder->codec_mutex, false);
 }
 
+// Caller owns codec_mutex. Output thread never takes that mutex.
 static void kill_decoder(AndroidChiakiVideoDecoder *decoder)
 {
-	chiaki_mutex_lock(&decoder->codec_mutex);
-	decoder->shutdown_output = true;
-	ssize_t codec_buf_index = AMediaCodec_dequeueInputBuffer(decoder->codec, 1000);
-	if(codec_buf_index >= 0)
-	{
-		CHIAKI_LOGI(decoder->log, "Video Decoder sending EOS buffer");
-		AMediaCodec_queueInputBuffer(decoder->codec, (size_t)codec_buf_index, 0, 0, decoder->timestamp_cur++, AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM);
-		AMediaCodec_stop(decoder->codec);
-		chiaki_mutex_unlock(&decoder->codec_mutex);
-		chiaki_thread_join(&decoder->output_thread, NULL);
-	}
-	else
-	{
-		CHIAKI_LOGE(decoder->log, "Failed to get input buffer for shutting down Video Decoder!");
-		AMediaCodec_stop(decoder->codec);
-		chiaki_mutex_unlock(&decoder->codec_mutex);
-	}
+	__atomic_store_n(&decoder->shutdown_output, true, __ATOMIC_RELEASE);
+	chiaki_thread_join(&decoder->output_thread, NULL);
+	AMediaCodec_stop(decoder->codec);
 	AMediaCodec_delete(decoder->codec);
 	decoder->codec = NULL;
-	decoder->shutdown_output = false;
+	if(decoder->window)
+		ANativeWindow_release(decoder->window);
+	decoder->window = NULL;
+	__atomic_store_n(&decoder->shutdown_output, false, __ATOMIC_RELEASE);
 }
 
 void android_chiaki_video_decoder_fini(AndroidChiakiVideoDecoder *decoder)
 {
+	chiaki_mutex_lock(&decoder->codec_mutex);
 	if(decoder->codec)
 		kill_decoder(decoder);
+	chiaki_mutex_unlock(&decoder->codec_mutex);
 	chiaki_mutex_fini(&decoder->codec_mutex);
 }
 
@@ -68,7 +61,7 @@ void android_chiaki_video_decoder_set_surface(AndroidChiakiVideoDecoder *decoder
 			kill_decoder(decoder);
 			CHIAKI_LOGI(decoder->log, "Decoder shut down after surface was removed");
 		}
-		return;
+		goto beach;
 	}
 
 	if(decoder->codec)
@@ -76,9 +69,13 @@ void android_chiaki_video_decoder_set_surface(AndroidChiakiVideoDecoder *decoder
 #if __ANDROID_API__ >= 23
 		CHIAKI_LOGI(decoder->log, "Video decoder already initialized, swapping surface");
 		ANativeWindow *new_window = surface ? ANativeWindow_fromSurface(env, surface) : NULL;
-		AMediaCodec_setOutputSurface(decoder->codec, new_window);
-		ANativeWindow_release(decoder->window);
-		decoder->window = new_window;
+		if(new_window && AMediaCodec_setOutputSurface(decoder->codec, new_window) == AMEDIA_OK)
+		{
+			ANativeWindow_release(decoder->window);
+			decoder->window = new_window;
+		}
+		else if(new_window)
+			ANativeWindow_release(new_window);
 #else
 		CHIAKI_LOGE(decoder->log, "Video Decoder already initialized");
 #endif
@@ -86,6 +83,8 @@ void android_chiaki_video_decoder_set_surface(AndroidChiakiVideoDecoder *decoder
 	}
 
 	decoder->window = ANativeWindow_fromSurface(env, surface);
+	if(!decoder->window)
+		goto beach;
 
 	const char *mime = chiaki_codec_is_h265(decoder->target_codec) ? "video/hevc" : "video/avc";
 	CHIAKI_LOGI(decoder->log, "Initializing decoder with mime %s", mime);
@@ -102,7 +101,22 @@ void android_chiaki_video_decoder_set_surface(AndroidChiakiVideoDecoder *decoder
 	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_WIDTH, decoder->target_width);
 	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_HEIGHT, decoder->target_height);
 
+	// Android 11+ decoder hint. Older or unsupported codecs may ignore it.
+	AMediaFormat_setInt32(format, "low-latency", 1);
 	media_status_t r = AMediaCodec_configure(decoder->codec, format, decoder->window, NULL, 0);
+	if(r != AMEDIA_OK)
+	{
+		CHIAKI_LOGW(decoder->log, "ULL: retrying normal decoder configuration");
+		AMediaCodec_delete(decoder->codec);
+		decoder->codec = AMediaCodec_createDecoderByType(mime);
+		if(!decoder->codec)
+		{
+			AMediaFormat_delete(format);
+			goto error_surface;
+		}
+		AMediaFormat_setInt32(format, "low-latency", 0);
+		r = AMediaCodec_configure(decoder->codec, format, decoder->window, NULL, 0);
+	}
 	if(r != AMEDIA_OK)
 	{
 		CHIAKI_LOGE(decoder->log, "AMediaCodec_configure() failed: %d", (int)r);
@@ -122,6 +136,7 @@ void android_chiaki_video_decoder_set_surface(AndroidChiakiVideoDecoder *decoder
 	if(err != CHIAKI_ERR_SUCCESS)
 	{
 		CHIAKI_LOGE(decoder->log, "Failed to create output thread for AMediaCodec");
+		AMediaCodec_stop(decoder->codec);
 		goto error_codec;
 	}
 
@@ -189,29 +204,42 @@ static void *android_chiaki_video_decoder_output_thread_func(void *user)
 {
 	AndroidChiakiVideoDecoder *decoder = user;
 
-	while(1)
+	while(!__atomic_load_n(&decoder->shutdown_output, __ATOMIC_ACQUIRE))
 	{
 		AMediaCodecBufferInfo info;
-		ssize_t status = AMediaCodec_dequeueOutputBuffer(decoder->codec, &info, -1);
+		ssize_t status = AMediaCodec_dequeueOutputBuffer(decoder->codec, &info, 10000);
 		if(status >= 0)
 		{
-			AMediaCodec_releaseOutputBuffer(decoder->codec, (size_t)status, info.size != 0);
-			if(info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM)
+			// Drain only immediately available decoded pictures, with a strict bound.
+			// Never discard compressed reference frames or wait for a future picture.
+			bool eos = (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) != 0;
+			for(unsigned int i = 0; i < 3 && !eos; ++i)
 			{
-				CHIAKI_LOGI(decoder->log, "AMediaCodec reported EOS");
-				break;
+				AMediaCodecBufferInfo next_info;
+				ssize_t next = AMediaCodec_dequeueOutputBuffer(decoder->codec, &next_info, 0);
+				if(next < 0)
+					break;
+				eos = (next_info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) != 0;
+				if(next_info.size == 0 || (next_info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG))
+				{
+					AMediaCodec_releaseOutputBuffer(decoder->codec, (size_t)next, false);
+					continue;
+				}
+				AMediaCodec_releaseOutputBuffer(decoder->codec, (size_t)status, false);
+				status = next;
+				info = next_info;
 			}
+			bool render = info.size != 0 && !(info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG)
+				&& !__atomic_load_n(&decoder->shutdown_output, __ATOMIC_ACQUIRE);
+			AMediaCodec_releaseOutputBuffer(decoder->codec, (size_t)status, render);
+			if(eos)
+				break;
 		}
-		else
+		else if(status != AMEDIACODEC_INFO_TRY_AGAIN_LATER && status != AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED
+			&& status != AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED)
 		{
-			chiaki_mutex_lock(&decoder->codec_mutex);
-			bool shutdown = decoder->shutdown_output;
-			chiaki_mutex_unlock(&decoder->codec_mutex);
-			if(shutdown)
-			{
-				CHIAKI_LOGI(decoder->log, "Video Decoder Output Thread detected shutdown after reported error");
-				break;
-			}
+			CHIAKI_LOGE(decoder->log, "ULL: output decoder error %d", (int)status);
+			break;
 		}
 	}
 

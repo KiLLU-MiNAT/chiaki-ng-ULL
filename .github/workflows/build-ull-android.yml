@@ -1,0 +1,40 @@
+name: Build Chiaki ULL Android ARM64
+on:
+  push:
+    branches: [android-ull-v0.1]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y make perl protobuf-compiler python3-protobuf python3-pip
+          python3 -m pip install --user --break-system-packages protobuf
+          sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;28.2.13676358' 'cmake;3.22.1'
+      - name: Build signed debug APK
+        working-directory: android
+        run: bash ./gradlew --no-daemon --stacktrace :app:assembleDebug
+      - name: Verify APK signature and ARM64 library
+        run: |
+          APK=android/app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify "$APK"
+          unzip -l "$APK" | grep 'lib/arm64-v8a/libchiaki-jni.so'
+          cp "$APK" Chiaki-ULL-Android-v0.1-arm64.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Chiaki-ULL-Android-v0.1-arm64
+          path: Chiaki-ULL-Android-v0.1-arm64.apk
+          if-no-files-found: error
